@@ -1,0 +1,21 @@
+大方向：
+1.linux操作系统的掌握程度，如锁，文件系统VFS，进程调度，TCP/IP等
+2.jvm的掌握程度，如源码的阅读程度，NIO、锁的使用等
+3.mysql的掌握程度，如源码的阅读程度，ACID的实现等
+4.常用算法以及数据结构的掌握程度，尤其tree和graph
+5.常用机器学习算法的掌握程度，尤其梯度下降法，SVM和简单的神经网络
+6.LL和LR等编译原理的掌握
+
+其他：
+1.Tomcat
+2.Netty
+3.Spring
+4.Groovy
+5.hadoop and HDFS
+6.python
+7.maven and gradle
+8.git
+9.shell
+10.nutch
+11.lucene
+12.solr
