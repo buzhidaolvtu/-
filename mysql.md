@@ -1,4 +1,4 @@
-#问题
+# 问题
 transaction -> redo log -> undo log -> buffer pool -> doublewrite buffer -> disk  
 如果发生了crash,  
 怎样判断哪些事物已经flush到disk中，哪些事物还在redo log中;  
