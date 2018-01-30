@@ -10,3 +10,8 @@ transaction -> redo log -> undo log -> buffer pool -> doublewrite buffer -> disk
 什么是Mini transaction;  
 如果log buffer不足会发生什么;  
 
+# 2018.01.30
+https://www.percona.com/blog/2007/12/19/mvcc-transaction-ids-log-sequence-numbers-and-snapshots/
+
+The LSN do not relate much to transactions – changes from different transactions are intermixed in the log files and many LSNs can correspond to changes from the same transaction.
+
