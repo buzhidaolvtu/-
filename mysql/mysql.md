@@ -12,6 +12,9 @@ transaction -> redo log -> undo log -> buffer pool -> doublewrite buffer -> disk
 
 # 2018.01.30
 https://www.percona.com/blog/2007/12/19/mvcc-transaction-ids-log-sequence-numbers-and-snapshots/
+https://www.percona.com/blog/2014/03/28/innodb-redo-log-archiving/
 
-The LSN do not relate much to transactions – changes from different transactions are intermixed in the log files and many LSNs can correspond to changes from the same transaction.
+The LSN do not relate much to transactions – changes from different transactions are intermixed in the log files and many LSNs can correspond to changes from the same transaction.  
+
+
 

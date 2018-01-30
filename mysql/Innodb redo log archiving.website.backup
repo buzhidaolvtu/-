@@ -1,0 +1,265 @@
+Innodb redo log archiving
+Vlad Lesin  | March 28, 2014 |  Posted In: Insight for DBAs, Insight for Developers, MySQL, Percona Server for MySQL, Percona XtraBackup
+
+Innodb redo log archivingPercona Server 5.6.11-60.3 introduces a new “log archiving” feature. Percona XtraBackup 2.1.5 supports “apply archived logs.” What does it mean and how it can be used?
+
+Percona products propose three kinds of incremental backups. The first is full scan of data files and comparison the data with backup data to find some delta. This approach provides a history of changes and saves disk space by storing only data deltas. But the disadvantage is a full-data file scan that adds load to the disk subsystem. The second kind of incremental backup avoids extra disk load during data file scans.
+
+The idea is in reading only changed data pages. The information about what specific pages were changed is provided by the server itself which writes files with the information during work. It’s a good alternative but changed-pages tracking adds some small load. And Percona XtraBackup’s delta reading leads to non-sequential disk io. This is good alternative but there is one more option.
+
+The Innodb engine has a data log. It writes all operations which modify database pages to log files. This log is used in the case of unexpected server terminating to recover data. The Innodb log consists of the several log files which are filled sequentially in circular. The idea is to save those files somewhere and apply all modifications from archived logs to backup data files. The disadvantage of this approach is in using extra disk space. The advantage is there is no need to do an “explicit” backup on the host server. A simple script could sit and wait for logs to appear then scp/netcat them over to another machine.
+
+But why not use good-old replication? Maybe replication does not have such performance as logs recovering but it is more controlled and well-known. Archived logs allows you to do any number of things with them from just storing them to doing periodic log applying. You can not recover from a ‘DROP TABLE’, etc with replication. But with this framework one could maintain the idea of “point in time” backups.
+
+So the “archived logs” feature is one more option to organize incremental backups. It is not widely used as it was issued not so far and there is not A good understanding of how it works and how it can be used. We are open to any suggestions about its suggest improvements and use cases. The subject of this post is to describe how it works in depth. As log archiving is closely tied with innodb redo logs the internals of redo logs will be covered too. This post would be useful not only for DBA but also for Software Engineers because not only common principles are considered but the specific code too, and knowledge from this post can be used for further MySQL code exploring and patching.
+
+What is the innodb log and how it is written?
+Let’s remember what are innodb logs, why they are written, what they are used for.
+
+The Innodb engine has buffer pool. This is a cache of database pages. Any changes are done on page in buffer pool, then page is considered as “dirty,” which means it must be flushed, and pushed to the flush list which is processed periodically by special thread. If pages are not flushed to disk and server is terminated unexpectedly the changes will be lost. To avoid this innodb writes changes to redo log and recover data from redo log during start. This technique allows to delay buffer pool pages flushing. It can increase performance because several changes of one page can be accumulated in memory and then flushed by one io. Except that flushed pages can be grouped to decrease the number of non-sequential io’s. But the down-side of this approach is time for data recovering. Let’s consider how this log is stored, generated and used for data recovering.
+
+Log files
+Redo log consists of a several log files which are treated as a circular buffer. The number and the size of log files can be configured. Each log file has a header. The description of this header can be found in “storage/innobase/include/log0log.h” by “LOG_GROUP_ID” keyword.
+
+Each log file contains log records. Redo log records are written sequentially by log blocks of OS_FILE_LOG_BLOCK_SIZE size which is equal to 512 bytes by default and can be changed with innodb option. Each record has its LSN. LSN is a “Log Sequence Number” – the number of bytes written to log from the log creation to the certain log record. Each block consists of header, trailer and log records.
+
+Log blocks
+Let’s consider log block header. The first 4 bytes of the header is log block number. The block number is very similar as LSN but LSN is measured in bytes and block number is measured by OS_FILE_LOG_BLOCK_SIZE. Here is the simple formula how LSN is converted to block number:
+
+return(((ulint) (lsn / OS_FILE_LOG_BLOCK_SIZE) & 0x3FFFFFFFUL) + 1);
+
+This formula can be found in log_block_convert_lsn_to_no() function. The next two bytes is the number of bytes used in the block. The next two bytes is the offset of the first MTR log record in this block. What is MTR will be described below. Currently it can be considered as a synonym of bunch of log records which are gathered together as a description of some logical operation. For example it can be a group of log records for inserting new row to some table. This field is used when there are records of several MTR’s in one block. The next four bytes is a checkpoint number. The trailer is four bytes of log block checksum. The above description can be found in “storage/innobase/include/log0log.h” by “LOG_BLOCK_HDR_NO” keyword.
+
+Before writing to disk log blocks must be somehow formed and stored. And the question is:
+
+How log blocks are stored in memory and on disk?
+Where log blocks are stored before flushing to disk and how they are written and flushed?
+
+Global log object and log buffer
+The answer to the first part of the question is log buffer. Server holds very important global object log_sys in memory. It contains a lot of useful information about logging state. Log buffer is pointed by log_sys->buf pointer which is initialized in log_init(). I would highlight the following log_sys fields that are used for work with log buffer and flushing:
+
+log_sys->buf_size – the size of log buffer, can be set with innodb-log-buffer-size variable, the default value is 8M;
+log_sys->buf_free – the offset from which the next log record will be written;
+log_sys->max_buf_free – if log_sys->buf_free is greater then this value log buffer must be flushed, see log_free_check();
+log_sys->buf_next_to_write – the offset of the next log record to write to disk;
+log_sys->write_lsn – the LSN up to which log is written;
+log_sys->flushed_to_disk_lsn – the LSN up to which log is written and flushed;
+log_sys->lsn – the last LSN in log buffer;
+
+So log_sys->buf_next_to_write is between 0 and log_sys->buf_free, log_sys->write_lsn is equal or less log_sys->lsn, log_sys->flushed_to_disk_lsn is less or equal to log_sys->write_lsn.
+
+The relationships for those fields can be easily traced with debugged by setting up watchpoints.
+
+Ok, we have log buffer, but how do log records come to this buffer?
+
+Where log records come from?
+Innodb has special objects that allow you to gather redo log records for some operations in one bunch before writing them to log buffer. These objects are called “mini-transactions” and corresponding functions and data types have “mtr” prefix in the code. The objects itself are described in mtr_t “c” structure. The most interesting fields of this structure are the following:
+
+mtr_t::log – contains log records for the mini-transaction,
+mtr_t::memo – contains pointers to pages which are changed or locked by the mini-transaction, it is used to push pages to flush list and release locks after logs records are copied to log buffer in mtr_commit() (see mtr_memo_pop_all() called in mtr_commit()).
+
+mtr_start() function initializes an object of mtr_t type and mtr_commit() writes log records from mtr_t::log to log_sys->buf + log_sys->buf_free. So the typical sequence of any operation which changes data is the following:
+
+
+mtr_start(); // initialize mtr object
+some_ops... // operations on data which are logged in mtr_t::log
+mtr_commit(); // write logged operations from mtr_t::log to log buffer log_sys->buf
+
+page_cur_insert_rec_write_log() is a good example of how mtr records can be written and mtr::memo can be filled. The low-level function which writes data to log buffer is log_write_low(). This function is invoked inside of mtr_commit() and not only copy the log records from mtr_t object to log buffer log_sys->buf but also creates a new log blocks inside of log_sys->buf, fills their header, trailer, calculates checksum.
+
+So log buffer contains log blocks which are sequentially filled with log records which are grouped in “mini-transactions” which logically can be treated as some logical operation over data which consists of a sequence of mini-operations(log records).
+
+As log records are written sequentially in log buffer one mini-transaction and even one log record can be written in two neighbour blocks. That is why the header field which would contain the offset of the first MTR in the block is necessary to calculate the point from which log records parsing can be started. This field was described in 2.2.
+
+So we have a buffer of log blocks in a memory. How is data from this buffer written to disk? The mysql documentation says that this depends on innodb_flush_log_at_trx_commit option. There can be three cases depending on the value of this option. Let’s consider each of them.
+
+Writing log buffer to disk: innodb_flush_log_at_trx_commit is 1 or 2.
+The first two cases is when innodb_flush_log_at_trx_commit is 1 or 2. In these cases flush log records are written for 2 and flushed for 1 on each transaction commit. If innodb_flush_log_at_trx_commit is 2 log records are flushed periodically by special thread which will be considered later. The low-level function which writes log records from buffer to file is log_group_write_buf(). But in the most cases it is not called directly but it is called from more high level log_write_up_to(). For the current case the calling stack is the following:
+
+
+(trx_commit_in_memory() or
+trx_commit_complete_for_mysql() or
+trx_prepare() e.t.c)->
+trx_flush_log_if_needed()->
+trx_flush_log_if_needed_low()->
+log_write_up_to()->
+log_group_write_buf().
+
+It is quite easy to find the higher levels of calling stack, just set up breakpoint on log_group_write_buf() and execute any sql query that modifies innodb data. For example for the simple “insert” sql query the higher levels of calling stack are the following:
+
+
+mysql_execute_command()->
+trans_commit_stmt()->
+ha_commit_trans()->
+TC_LOG_DUMMY::commit()->
+ha_commit_low()->
+innobase_commit()->
+trx_commit_complete_for_mysql()->
+trx_flush_log_if_needed()-> ... .
+
+log_io_complete() callback is invoked when i/o is finished for log files (see fil_aio_wait()). log_io_complete() flushes log files if this is not forbidden by innodb_flush_method or innodb_flush_log_at_trx_commit options.
+
+Writing log buffer to disk: innodb_flush_log_at_trx_commit is equal to 0
+The third case is when innodb_flush_log_at_trx_commit is equal to 0. For this case log buffer is NOT written to disk on transaction commit, it is written and flushed periodically by separate thread “srv_master_thread”. If innodb_flush_log_at_trx_commit = 0 log files are flushed in the same thread by the same calls. The calling stack is the following:
+
+
+srv_master_thread()->
+(srv_master_do_active_tasks() or srv_master_do_idle_tasks() or srv_master_do_shutdown_tasks())->
+srv_sync_log_buffer_in_background()->
+log_buffer_sync_in_background()->log_write_up_to()->... .
+
+Special cases for logs flushing
+While log_io_complete() do flushing depending on innodb_flush_log_at_trx_commit value among others log_write_up_to() has it’s own flushing criteria. This is flush_to_disk function argument. So it is possible to force log files flushing even if innodb_flush_log_at_trx_commit = 0. Here are examples of such cases:
+
+1) buf_flush_write_block_low()
+Each page contains information about the last applied LSN(buf_flush_write_block_low::newest_modification), each log record is a description of change on certain page. Imagine we flushed some changed pages but log records for these pages were not flushed and server goes down. After starting the server some pages will have the newest modifications, but some of them were not flushed and the correspondent log records are lost too. We will have inconsistent database in this case. That is why log records must be flushed before the pages they refer.
+
+2) srv_sync_log_buffer_in_background()
+As it was described above this function is called periodically by special thread and forces flushing.
+
+3) log_checkpoint()
+When checkpoint is made log files must be reliably flushed.
+
+4) The special handlerton innobase_flush_logs() which can be called through ha_flush_logs() from mysql server.
+For example ha_flush_logs() is called from MYSQL_BIN_LOG::reset_logs() when “RESET MASTER” or “RESET SLAVE” are executed.
+
+5) srv_master_do_shutdown_tasks() – on shutdown, ha_innobase::create() – on table creating, ha_innobase::delete_table() – on table removing, innobase_drop_database() – on all database tables removing, innobase_rename_table() – on table rename e.t.c
+
+If log files are treated as circular buffer what happens when the buffer is overflown?
+Briefly. Innodb has a mechanism which allows you to avoid overflowing. It is called “checkpoints.” The checkpoint is a state when log files are synchronized with data files. In this case there is no need to keep the history of changes before checkpoint because all pages with the last modifications LSN less or equal to checkpoint LSN are flushed and the log files space from the last written LSN to the last checkpoint LSN can be reused. We will not describe a checkpoint process here because it is a separate interesting subject. The only thing we need to know is when checkpoint happens all pages with modification LSN less or equal to checkpoint LSN are reliably flushed.
+
+How archived logs are written by server.
+So the log contains information about page changes. But as we said, log files are the circular buffer. This means that they occupy fixed disk size and the oldest records can be rewritten by the newest ones as there are points when data files are synchronized with log files called checkpoints and there is no need to store the previous history of log records to guarantee database consistency. The idea is to save somewhere all log records to have the possibility of applying them to backuped data to have some kind if incremental backup. For example if we want to have an archive of log records. As log consists of log files it is reasonable to store log records in such files too, and these files are called “archived logs.”
+
+Archived log files are written to the directory which can be set with special innodb option. Each file has the same size as innodb log size and the suffix of each archived file is the LSN from which it is started.
+
+As well as log writing system log archiving system stores its data in global log_sys object. Here are the most valuable fields in log_sys from my point of view:
+
+log_sys->archive_buf, log_sys->archive_buf_size – logs archive buffer and its size, log records are copied from log buffer log_sys->buf to this buffer before writing to disk;
+log_sys->archiving_phase – the current phase of log archiving: LOG_ARCHIVE_READ when log records are being copied from log_sys->buf to log_sys->archive_buf, LOG_ARCHIVE_WRITE when log_sys->archive_buf is being written to disk;
+log_sys->archived_lsn – the LSN to which log files are written;
+log_sys->next_archived_lsn – the LSN to which write operations was invoked but not yet finished;
+log_sys->max_archived_lsn_age – the maximum difference between log_sys->lsn and log_sys->archived_lsn, if this difference exceeds the log are being archived synchronously, i.e. the difference is decreased;
+log_sys->archive_lock – this is rw-lock which is used for synchronizing LOG_ARCHIVE_WRITE and LOG_ARCHIVE_READ phases, it is x-locked on LOG_ARCHIVE_WRITE phase.
+
+So how is data copied from log_sys->buf to log_sys->archived_buf? log_archive_do() is used for this. It is not only set the proper state for archived log fields in log_sys but also invokes log_group_read_log_seg() with corresponding arguments which not only copy data from log buffer to archived log buffer but also invokes asynchronous write operation for archived log buffer. log_archive_do() can wait until io operations are finished using log_sys->archive_lock if corresponding function parameter is set.
+
+The main question is on what circumstances log_archive_do() is invoked, i.e. when log records are being written to archived log files. The first call stack is the following:
+
+
+log_free_check()->
+log_check_margins()->
+log_archive_margin()->
+log_archive_do().
+
+Here is text of log_free_check() with comments:
+
+
+/*********************************************************************//
+Checks if there is need for a log buffer flush or a new checkpoint, and does
+this if yes. Any database operation should call this when it has modified
+more than about 4 pages. NOTE that this function may only be called when the
+OS thread owns no synchronization objects except the dictionary mutex. */
+UNIV_INLINE
+void
+log_free_check(void)
+/*================*/
+{
+
+#ifdef UNIV_SYNC_DEBUG
+ut_ad(sync_thread_levels_empty_except_dict());
+#endif /* UNIV_SYNC_DEBUG */
+
+if (log_sys->check_flush_or_checkpoint) {
+
+log_check_margins();
+}
+}
+
+log_sys->check_flush_or_checkpoint is set when there is no enough free space in log buffer or it is time to do checkpoint or any other bound case. log_archive_margin() is invoked only if the limit if the difference between log_sys->lsn and log_sys->archived_lsn is exceeded. Let’s refer to this difference as archived lsn age.
+
+One more call log_archive_do() is from log_open() when archived lsn age exceeds some limit. log_open() is called on each mtr_commit(). And for this case archived logs are written synchronously.
+
+The next synchronous call is from log_archive_all() during shutdown.
+
+Summarizing all above archived logs begins to be written when the log buffer is full enough to be written or when checkpoint happens or when the server is in the process of shut down. And there is no any delay between writing to archive log buffer and writing to disk. I mean there is no way to say that archived logs must be written once a second as it is possible for redo logs with innodb_flush_log_at_trx_commit = 0. As soon as data is copied to the buffer the write operation is invoked immediately for this buffer. Archived log buffer is not filled on each mtr_commit() so it does not slow down the usual logging process. The exception is when there are a lot of io operations what can be the reason of archive log age is too big. The result of big archive log age is the synchronous archived logs writing during mtr_commit(). Memory to memory copying is quite fast operation that is why the data is copied to archived log buffer and is written to disk asynchronously minimizing delays which can be caused by logs archiving.
+
+PS: Here is another call stack for writing archived log buffer to archived log files:
+
+log_io_complete()->log_io_complete_archive()->log_archive_check_completion_low()->log_archive_groups().
+
+I propose to explore this stack yourself.
+
+Logs recovery process, how it is started and works inside. Archived logs applying.
+So we discovered how innodb redo logging works, and how redo logs are archived. And the last uncovered thing is how recovery works and how archived logs are applied. These two processes are very similar – that is why they are discussed in one section of this post.
+
+The story begins with innobase_start_or_create_for_mysql() which is invoked from innobase_init(). The following trident in innobase_start_or_create_for_mysql() can be used to search the relevant code:
+
+
+if (create_new_db) {
+...
+} else if (srv_archive_recovery) {
+...
+} else {
+...
+}
+
+The second condition and the last one is the place from which archived logs applying and innodb logs recovery processes correspondingly start. These two blocks wrap two pairs of functions:
+
+
+recv_recovery_from_archive_start()
+recv_recovery_from_archive_finish()
+
+and
+
+recv_recovery_from_checkpoint_start()
+recv_recovery_from_checkpoint_finish()
+
+And all the magic happens in these pairs. As well as global log_sys object for redo logging there is global recv_sys object for innodb recovery and archived logs applying. It is created and initialized in recv_sys_create() and recv_sys_init() functions correspondingly. The following fields if recv_sys object are the most important from my point:
+
+recv_sys->limit_lsn – the LSN up to which recovery should be made, this value is initialized with the maximum value of uint64_t(see #define LSN_MAX) for the recovery process and with certain value which is passed as an argument of recv_recovery_from_archive_start() function and can be set via xtrabackup option for log applying;
+recv_sys->parse_start_lsn – the LSN from which logs parsing is started, for the the logs recovery this value equals to the last checkpoint LSN, for logs applying this is last applied LSN;
+recv_sys->scanned_lsn – the LSN up to which log files are scanned;
+recv_sys->recovered_lsn – the LSN up to which log records are applied, this value <= recv_sys->scanned_lsn;
+
+The first thing that must be done for starting recovery process is to find out the point in log files where the recovery must be started from. This is the last checkpoint LSN. recv_find_max_checkpoint() proceed this. As we can see in log_group_checkpoint() the following code writes checkpoint info into two places in the first log file depending on the checkpoint number:
+
+
+/* We alternate the physical place of the checkpoint info in the first
+log file */
+
+ 
+
+if ((log_sys->next_checkpoint_no & 1) == 0) {
+write_offset = LOG_CHECKPOINT_1;
+} else {
+write_offset = LOG_CHECKPOINT_2;
+}
+
+So recv_find_max_checkpoint() reads checkpoint info from both places and selects the latest checkpoint.
+
+The same idea is applied for logs, too, but the last applied LSN instead of last checkpoint LSN must be found. Here is the call stack for reading last applied LSN:
+
+
+innobase_start_or_create_for_mysql()->
+open_or_create_data_files()->
+fil_read_first_page().
+
+The last applied LSN is stored in the first page of data files in (min|max)_flushed_lsn fields(see FIL_PAGE_FILE_FLUSH_LSN offset). These values are written in fil_write_flushed_lsn_to_data_files() function on server shutdown.
+
+So the main difference between logs applying and recovery process at this stage is the manner of calculating LSN from which log records will be read. For logs applying the last flushed LSN is used but for recovery process it is the last checkpoint LSN. Why does this difference take place? Logs can be applied periodically. Assume we gather archived logs and apply them once an hour to have fresh backup. After applying the previous bunch of log files there can be unfinished transactions. For the recovery process any unfinished transactions are rolled back to have consistent db state at server starting. But for the logs applying process there is no need to roll back them because any unfinished transactions can be finished during the next logs applying.
+
+After calculating the start LSN the sequence of actions is the same for both recovering and applying. The next step is reading and parsing log records. See recv_group_scan_log_recs() which is invoked from recv_recovery_from_checkpoint_start_func() for logs recovering and recv_recovery_from_archive_start()->log_group_recover_from_archive_file() for logs applying.
+
+The first we read log records to some buffer and then invoke recv_scan_log_recs() to parse them. recv_scan_log_recs() checks each log block on consistency(checksum + comparing the log block number written in log block with log block number calculated from log block LSN) and other edge cases and copy it to parsing buffer recv_sys->buf with recv_sys_add_to_parsing_buf() function. The parsing buffer is then parsed by recv_parse_log_recs(). Log records are stored in hash table recv_sys->addr_hash. The key for this hash table is calculated basing on space id and page number pair. This pair refers to the page to which log records must be applied. The value of the hash table is object of recv_addr_t type. recv_addr_t type contains rec_list field which is the list of log records for applying to the (space id, page num) page (see recv_add_to_hash_table().
+
+After parsing and storing log record in hash table recv_sys->addr_hash log records are applied. The function which is responsible for log records applying is recv_apply_hashed_log_recs(). It is invoked from recv_scan_log_recs() if there is no enough memory to store log records and at the end of recovering/applying process. For each element of recv_sys->addr_hash, i.e. for each DB page which must be changed with log records recv_recover_page() is invoked. It can be invoked as from recv_apply_hashed_log_recs() in the case if page is already in buffer pool of from buf_page_io_complete() on io completion, i.e. just after page was read from storage. Applying log records on page read completion is necessary and very convenient. Assume log records have not yet applied as we had enough memory to store the whole recovery log records. But we want for example to boot DB dictionary. I this case any records that concern to the pages of the dictionary will be applied to those pages just after reading them from storage to buffer pool.
+
+The function which applies log records to the certain page is recv_recover_page_func(). It gets the list of log records for the certain page from recv_sys->addr_hash hash table, for each element of this list it compares the lsn of last page changes with the LSN of the record, and if the former is greater the later it applies log record to the page.
+
+After applying all log records from archived logs xtrabackup writes last applied LSN to (min|max)_flushed LSN fields of each data file and finishes execution. The logs recovery process rollbacks all unfinished transactions unless this is forbidden with innodb-force-recovery parameter.
+
+Conclusion
+We covered the processes of redo logs writing and recovery in depth. These are very important processes as they provide data consistency on crashes. These two processes became a base for logs archiving and applying features. As log records can describe any data changes the idea is to store these records somewhere and then apply them to backups for organizing some kind of incremental backup.
+
+The features were implemented a short time ago and currently they are not widely used. So if you have something to say about them you are welcome to comment for discussion.
